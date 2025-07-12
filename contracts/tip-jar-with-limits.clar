@@ -22,6 +22,14 @@
   uint 
   { total-amount: uint, tip-count: uint })
 
+(define-map user-milestones 
+  principal 
+  { milestone-level: uint, multiplier-uses: uint })
+
+(define-data-var milestone-1 uint u5000000)
+(define-data-var milestone-2 uint u10000000)
+(define-data-var milestone-3 uint u25000000)
+
 (define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender)))
 
@@ -63,6 +71,33 @@
 (define-read-only (get-current-day-stats)
   (get-daily-stats (get-current-day)))
 
+(define-read-only (get-user-milestone (user principal))
+  (default-to 
+    { milestone-level: u0, multiplier-uses: u0 }
+    (map-get? user-milestones user)))
+
+(define-read-only (calculate-milestone-level (total-tips uint))
+  (if (>= total-tips (var-get milestone-3))
+    u3
+    (if (>= total-tips (var-get milestone-2))
+      u2
+      (if (>= total-tips (var-get milestone-1))
+        u1
+        u0))))
+
+(define-read-only (get-milestone-multiplier (level uint))
+  (if (is-eq level u3)
+    u3
+    (if (is-eq level u2)
+      u2
+      (if (is-eq level u1)
+        u150
+        u100))))
+
+(define-read-only (has-available-multiplier (user principal))
+  (let ((milestone-data (get-user-milestone user)))
+    (> (get multiplier-uses milestone-data) u0)))
+
 (define-public (send-tip (amount uint))
   (let ((current-day (get-current-day))
         (user-key { user: tx-sender, day: current-day })
@@ -82,21 +117,34 @@
       user-key 
       { amount: new-total })
     
-    (map-set user-total-tips 
-      tx-sender 
-      { 
-        total: (+ (get total user-stats) amount),
-        last-tip-block: stacks-block-height 
-      })
-    
-    (map-set daily-totals 
-      current-day 
-      { 
-        total-amount: (+ (get total-amount current-day-stats) amount),
-        tip-count: (+ (get tip-count current-day-stats) u1)
-      })
-    
-    (var-set total-tips-received (+ (var-get total-tips-received) amount))
+    (let ((new-total-tips (+ (get total user-stats) amount)))
+      (map-set user-total-tips 
+        tx-sender 
+        { 
+          total: new-total-tips,
+          last-tip-block: stacks-block-height 
+        })
+      
+      (let ((current-milestone (get-user-milestone tx-sender))
+            (new-level (calculate-milestone-level new-total-tips))
+            (current-level (get milestone-level current-milestone)))
+        (if (> new-level current-level)
+          (map-set user-milestones 
+            tx-sender 
+            { 
+              milestone-level: new-level, 
+              multiplier-uses: (if (is-eq new-level u1) u1 (if (is-eq new-level u2) u2 u3))
+            })
+          true))
+      
+      (map-set daily-totals 
+        current-day 
+        { 
+          total-amount: (+ (get total-amount current-day-stats) amount),
+          tip-count: (+ (get tip-count current-day-stats) u1)
+        })
+      
+      (var-set total-tips-received (+ (var-get total-tips-received) amount)))
     
     (ok { 
       amount: amount, 
@@ -159,14 +207,73 @@
       (> amount u0)
       (<= (+ current-tips amount) daily-limit))))
 
+(define-public (use-milestone-multiplier (amount uint))
+  (let ((current-day (get-current-day))
+        (user-key { user: tx-sender, day: current-day })
+        (current-user-tips (get amount (get-user-daily-tips tx-sender)))
+        (milestone-data (get-user-milestone tx-sender))
+        (multiplier (get-milestone-multiplier (get milestone-level milestone-data)))
+        (boosted-amount (/ (* amount multiplier) u100))
+        (new-total (+ current-user-tips boosted-amount))
+        (daily-limit (var-get daily-tip-limit))
+        (user-stats (get-user-total-tips tx-sender))
+        (current-day-stats (get-daily-stats current-day)))
+    
+    (asserts! (var-get contract-active) err-insufficient-amount)
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (> (get multiplier-uses milestone-data) u0) err-invalid-amount)
+    (asserts! (<= new-total daily-limit) err-daily-limit-exceeded)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set user-daily-tips 
+      user-key 
+      { amount: new-total })
+    
+    (map-set user-milestones 
+      tx-sender 
+      { 
+        milestone-level: (get milestone-level milestone-data),
+        multiplier-uses: (- (get multiplier-uses milestone-data) u1)
+      })
+    
+    (let ((new-total-tips (+ (get total user-stats) boosted-amount)))
+      (map-set user-total-tips 
+        tx-sender 
+        { 
+          total: new-total-tips,
+          last-tip-block: stacks-block-height 
+        })
+      
+      (map-set daily-totals 
+        current-day 
+        { 
+          total-amount: (+ (get total-amount current-day-stats) boosted-amount),
+          tip-count: (+ (get tip-count current-day-stats) u1)
+        })
+      
+      (var-set total-tips-received (+ (var-get total-tips-received) boosted-amount)))
+    
+    (ok { 
+      original-amount: amount,
+      boosted-amount: boosted-amount, 
+      multiplier: multiplier,
+      new-daily-total: new-total, 
+      remaining-limit: (- daily-limit new-total),
+      remaining-uses: (- (get multiplier-uses milestone-data) u1)
+    })))
+
 (define-read-only (get-tip-history-summary (user principal))
   (let ((daily-tips (get-user-daily-tips user))
         (total-tips (get-user-total-tips user))
-        (remaining (get-user-remaining-limit user)))
+        (remaining (get-user-remaining-limit user))
+        (milestone-data (get-user-milestone user)))
     {
       today-tips: (get amount daily-tips),
       total-tips: (get total total-tips),
       remaining-today: remaining,
       last-tip-block: (get last-tip-block total-tips),
-      current-day: (get-current-day)
+      current-day: (get-current-day),
+      milestone-level: (get milestone-level milestone-data),
+      multiplier-uses: (get multiplier-uses milestone-data)
     }))
