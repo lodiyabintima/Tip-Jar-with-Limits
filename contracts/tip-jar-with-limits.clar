@@ -5,6 +5,9 @@
 (define-constant err-invalid-amount (err u103))
 (define-constant err-withdrawal-failed (err u104))
 (define-constant err-tip-failed (err u105))
+(define-constant err-refund-window-expired (err u106))
+(define-constant err-tip-not-found (err u107))
+(define-constant err-refund-failed (err u108))
 
 (define-data-var daily-tip-limit uint u1000000)
 (define-data-var total-tips-received uint u0)
@@ -29,6 +32,13 @@
 (define-data-var milestone-1 uint u5000000)
 (define-data-var milestone-2 uint u10000000)
 (define-data-var milestone-3 uint u25000000)
+
+(define-data-var refund-window uint u10)
+(define-data-var next-tip-id uint u1)
+
+(define-map refundable-tips 
+  { user: principal, tip-id: uint } 
+  { amount: uint, block-height: uint, day: uint, is-multiplied: bool })
 
 (define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender)))
@@ -98,6 +108,21 @@
   (let ((milestone-data (get-user-milestone user)))
     (> (get multiplier-uses milestone-data) u0)))
 
+(define-read-only (get-refund-window)
+  (var-get refund-window))
+
+(define-read-only (is-refund-eligible (user principal) (tip-id uint))
+  (let ((tip-data (map-get? refundable-tips { user: user, tip-id: tip-id })))
+    (match tip-data
+      some-tip (let ((tip-block (get block-height some-tip))
+                     (current-block stacks-block-height)
+                     (window (var-get refund-window)))
+                 (<= (- current-block tip-block) window))
+      false)))
+
+(define-read-only (get-refundable-tip (user principal) (tip-id uint))
+  (map-get? refundable-tips { user: user, tip-id: tip-id }))
+
 (define-public (send-tip (amount uint))
   (let ((current-day (get-current-day))
         (user-key { user: tx-sender, day: current-day })
@@ -146,12 +171,24 @@
       
       (var-set total-tips-received (+ (var-get total-tips-received) amount)))
     
-    (ok { 
-      amount: amount, 
-      new-daily-total: new-total, 
-      remaining-limit: (- daily-limit new-total),
-      day: current-day 
-    })))
+    (let ((tip-id (var-get next-tip-id)))
+      (map-set refundable-tips 
+        { user: tx-sender, tip-id: tip-id }
+        { 
+          amount: amount, 
+          block-height: stacks-block-height, 
+          day: current-day, 
+          is-multiplied: false 
+        })
+      (var-set next-tip-id (+ tip-id u1))
+      
+      (ok { 
+        amount: amount, 
+        new-daily-total: new-total, 
+        remaining-limit: (- daily-limit new-total),
+        day: current-day,
+        tip-id: tip-id
+      }))))
 
 ;; (define-public (withdraw-tips (amount uint))
 ;;   (begin
@@ -254,14 +291,26 @@
       
       (var-set total-tips-received (+ (var-get total-tips-received) boosted-amount)))
     
-    (ok { 
-      original-amount: amount,
-      boosted-amount: boosted-amount, 
-      multiplier: multiplier,
-      new-daily-total: new-total, 
-      remaining-limit: (- daily-limit new-total),
-      remaining-uses: (- (get multiplier-uses milestone-data) u1)
-    })))
+    (let ((tip-id (var-get next-tip-id)))
+      (map-set refundable-tips 
+        { user: tx-sender, tip-id: tip-id }
+        { 
+          amount: boosted-amount, 
+          block-height: stacks-block-height, 
+          day: current-day, 
+          is-multiplied: true 
+        })
+      (var-set next-tip-id (+ tip-id u1))
+      
+      (ok { 
+        original-amount: amount,
+        boosted-amount: boosted-amount, 
+        multiplier: multiplier,
+        new-daily-total: new-total, 
+        remaining-limit: (- daily-limit new-total),
+        remaining-uses: (- (get multiplier-uses milestone-data) u1),
+        tip-id: tip-id
+      }))))
 
 (define-read-only (get-tip-history-summary (user principal))
   (let ((daily-tips (get-user-daily-tips user))
@@ -277,3 +326,57 @@
       milestone-level: (get milestone-level milestone-data),
       multiplier-uses: (get multiplier-uses milestone-data)
     }))
+
+(define-public (refund-tip (tip-id uint))
+  (let ((tip-key { user: tx-sender, tip-id: tip-id })
+        (tip-data (unwrap! (map-get? refundable-tips tip-key) err-tip-not-found)))
+    
+    (asserts! (is-refund-eligible tx-sender tip-id) err-refund-window-expired)
+    
+    (let ((refund-amount (get amount tip-data))
+          (tip-day (get day tip-data))
+          (is-multiplied (get is-multiplied tip-data))
+          (user-key { user: tx-sender, day: tip-day })
+          (current-user-daily (get amount (default-to { amount: u0 } (map-get? user-daily-tips user-key))))
+          (user-stats (get-user-total-tips tx-sender))
+          (day-stats (get-daily-stats tip-day)))
+      
+      (try! (as-contract (stx-transfer? refund-amount tx-sender tx-sender)))
+      
+      (map-set user-daily-tips 
+        user-key 
+        { amount: (- current-user-daily refund-amount) })
+      
+      (map-set user-total-tips 
+        tx-sender 
+        { 
+          total: (- (get total user-stats) refund-amount),
+          last-tip-block: (get last-tip-block user-stats)
+        })
+      
+      (map-set daily-totals 
+        tip-day 
+        { 
+          total-amount: (- (get total-amount day-stats) refund-amount),
+          tip-count: (- (get tip-count day-stats) u1)
+        })
+      
+      (var-set total-tips-received (- (var-get total-tips-received) refund-amount))
+      
+      (if is-multiplied
+        (let ((current-milestone (get-user-milestone tx-sender)))
+          (map-set user-milestones 
+            tx-sender 
+            { 
+              milestone-level: (get milestone-level current-milestone),
+              multiplier-uses: (+ (get multiplier-uses current-milestone) u1)
+            }))
+        true)
+      
+      (map-delete refundable-tips tip-key)
+      
+      (ok { 
+        refunded-amount: refund-amount,
+        tip-id: tip-id,
+        was-multiplied: is-multiplied
+      }))))
