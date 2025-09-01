@@ -8,6 +8,9 @@
 (define-constant err-refund-window-expired (err u106))
 (define-constant err-tip-not-found (err u107))
 (define-constant err-refund-failed (err u108))
+(define-constant err-execution-too-early (err u109))
+(define-constant err-schedule-not-found (err u110))
+(define-constant err-invalid-execution-block (err u111))
 
 (define-data-var daily-tip-limit uint u1000000)
 (define-data-var total-tips-received uint u0)
@@ -35,10 +38,15 @@
 
 (define-data-var refund-window uint u10)
 (define-data-var next-tip-id uint u1)
+(define-data-var next-schedule-id uint u1)
 
 (define-map refundable-tips 
   { user: principal, tip-id: uint } 
   { amount: uint, block-height: uint, day: uint, is-multiplied: bool })
+
+(define-map scheduled-tips 
+  { user: principal, schedule-id: uint } 
+  { amount: uint, execution-block: uint, use-multiplier: bool })
 
 (define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender)))
@@ -122,6 +130,15 @@
 
 (define-read-only (get-refundable-tip (user principal) (tip-id uint))
   (map-get? refundable-tips { user: user, tip-id: tip-id }))
+
+(define-read-only (get-scheduled-tip (user principal) (schedule-id uint))
+  (map-get? scheduled-tips { user: user, schedule-id: schedule-id }))
+
+(define-read-only (is-execution-ready (user principal) (schedule-id uint))
+  (let ((schedule-data (map-get? scheduled-tips { user: user, schedule-id: schedule-id })))
+    (match schedule-data
+      some-schedule (>= stacks-block-height (get execution-block some-schedule))
+      false)))
 
 (define-public (send-tip (amount uint))
   (let ((current-day (get-current-day))
@@ -380,3 +397,72 @@
         tip-id: tip-id,
         was-multiplied: is-multiplied
       }))))
+
+(define-public (schedule-tip (amount uint) (execution-block uint) (use-multiplier bool))
+  (begin
+    (asserts! (var-get contract-active) err-insufficient-amount)
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (> execution-block stacks-block-height) err-invalid-execution-block)
+    
+    (if use-multiplier
+      (asserts! (has-available-multiplier tx-sender) err-invalid-amount)
+      true)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (let ((schedule-id (var-get next-schedule-id)))
+      (map-set scheduled-tips 
+        { user: tx-sender, schedule-id: schedule-id }
+        { 
+          amount: amount, 
+          execution-block: execution-block, 
+          use-multiplier: use-multiplier 
+        })
+      (var-set next-schedule-id (+ schedule-id u1))
+      
+      (ok { 
+        schedule-id: schedule-id,
+        amount: amount,
+        execution-block: execution-block,
+        blocks-until-execution: (- execution-block stacks-block-height)
+      }))))
+
+(define-public (execute-scheduled-tip (schedule-id uint))
+  (let ((schedule-key { user: tx-sender, schedule-id: schedule-id })
+        (schedule-data (unwrap! (map-get? scheduled-tips schedule-key) err-schedule-not-found)))
+    
+    (asserts! (>= stacks-block-height (get execution-block schedule-data)) err-execution-too-early)
+    
+    (let ((amount (get amount schedule-data))
+          (use-multiplier (get use-multiplier schedule-data)))
+      
+      (map-delete scheduled-tips schedule-key)
+      
+      (if use-multiplier
+        (match (use-milestone-multiplier amount)
+          success (ok { 
+            executed-amount: amount,
+            schedule-id: schedule-id,
+            used-multiplier: true
+          })
+          error (err error))
+        (match (send-tip amount)
+          success (ok { 
+            executed-amount: amount,
+            schedule-id: schedule-id,
+            used-multiplier: false
+          })
+          error (err error))))))
+
+(define-public (cancel-scheduled-tip (schedule-id uint))
+  (let ((schedule-key { user: tx-sender, schedule-id: schedule-id })
+        (schedule-data (unwrap! (map-get? scheduled-tips schedule-key) err-schedule-not-found)))
+    
+    (try! (as-contract (stx-transfer? (get amount schedule-data) tx-sender tx-sender)))
+    
+    (map-delete scheduled-tips schedule-key)
+    
+    (ok { 
+      refunded-amount: (get amount schedule-data),
+      schedule-id: schedule-id
+    })))
