@@ -11,6 +11,8 @@
 (define-constant err-execution-too-early (err u109))
 (define-constant err-schedule-not-found (err u110))
 (define-constant err-invalid-execution-block (err u111))
+(define-constant err-matching-inactive (err u112))
+(define-constant err-matching-budget-exceeded (err u113))
 
 (define-data-var daily-tip-limit uint u1000000)
 (define-data-var total-tips-received uint u0)
@@ -47,6 +49,15 @@
 (define-map scheduled-tips 
   { user: principal, schedule-id: uint } 
   { amount: uint, execution-block: uint, use-multiplier: bool })
+
+(define-data-var matching-active bool false)
+(define-data-var matching-rate uint u50)
+(define-data-var matching-budget uint u0)
+(define-data-var total-matched uint u0)
+
+(define-map user-matched-totals 
+  principal 
+  { total-matched: uint, match-count: uint })
 
 (define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender)))
@@ -140,6 +151,24 @@
       some-schedule (>= stacks-block-height (get execution-block some-schedule))
       false)))
 
+(define-read-only (get-matching-status)
+  { 
+    active: (var-get matching-active),
+    rate: (var-get matching-rate),
+    budget: (var-get matching-budget),
+    total-matched: (var-get total-matched),
+    remaining-budget: (- (var-get matching-budget) (var-get total-matched))
+  })
+
+(define-read-only (get-user-matched-stats (user principal))
+  (default-to 
+    { total-matched: u0, match-count: u0 }
+    (map-get? user-matched-totals user)))
+
+(define-read-only (calculate-match-amount (tip-amount uint))
+  (let ((rate (var-get matching-rate)))
+    (/ (* tip-amount rate) u100)))
+
 (define-public (send-tip (amount uint))
   (let ((current-day (get-current-day))
         (user-key { user: tx-sender, day: current-day })
@@ -188,7 +217,14 @@
       
       (var-set total-tips-received (+ (var-get total-tips-received) amount)))
     
-    (let ((tip-id (var-get next-tip-id)))
+    (let ((tip-id (var-get next-tip-id))
+          (matching-enabled (var-get matching-active))
+          (match-amount (if matching-enabled (calculate-match-amount amount) u0))
+          (budget (var-get matching-budget))
+          (already-matched (var-get total-matched))
+          (can-match (and matching-enabled (<= (+ already-matched match-amount) budget)))
+          (final-match (if can-match match-amount u0)))
+      
       (map-set refundable-tips 
         { user: tx-sender, tip-id: tip-id }
         { 
@@ -199,12 +235,26 @@
         })
       (var-set next-tip-id (+ tip-id u1))
       
+      (if (> final-match u0)
+        (begin
+          (var-set total-matched (+ already-matched final-match))
+          (let ((user-match-stats (get-user-matched-stats tx-sender)))
+            (map-set user-matched-totals 
+              tx-sender 
+              { 
+                total-matched: (+ (get total-matched user-match-stats) final-match),
+                match-count: (+ (get match-count user-match-stats) u1)
+              }))
+          true)
+        true)
+      
       (ok { 
         amount: amount, 
         new-daily-total: new-total, 
         remaining-limit: (- daily-limit new-total),
         day: current-day,
-        tip-id: tip-id
+        tip-id: tip-id,
+        matched-amount: final-match
       }))))
 
 ;; (define-public (withdraw-tips (amount uint))
@@ -465,4 +515,53 @@
     (ok { 
       refunded-amount: (get amount schedule-data),
       schedule-id: schedule-id
+    })))
+
+(define-public (activate-matching-program (budget uint) (rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> budget u0) err-invalid-amount)
+    (asserts! (<= rate u100) err-invalid-amount)
+    
+    (var-set matching-active true)
+    (var-set matching-budget budget)
+    (var-set matching-rate rate)
+    (var-set total-matched u0)
+    
+    (ok { 
+      budget: budget,
+      rate: rate
+    })))
+
+(define-public (deactivate-matching-program)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    
+    (var-set matching-active false)
+    
+    (ok { 
+      final-matched: (var-get total-matched),
+      final-budget: (var-get matching-budget)
+    })))
+
+(define-public (update-matching-budget (additional-budget uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> additional-budget u0) err-invalid-amount)
+    
+    (var-set matching-budget (+ (var-get matching-budget) additional-budget))
+    
+    (ok { 
+      new-budget: (var-get matching-budget)
+    })))
+
+(define-public (update-matching-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-rate u100) err-invalid-amount)
+    
+    (var-set matching-rate new-rate)
+    
+    (ok { 
+      new-rate: new-rate
     })))
