@@ -26,6 +26,10 @@
   principal 
   { total: uint, last-tip-block: uint })
 
+(define-map user-limit-overrides 
+  principal 
+  uint)
+
 (define-map daily-totals 
   uint 
   { total-amount: uint, tip-count: uint })
@@ -82,7 +86,7 @@
 
 (define-read-only (get-user-remaining-limit (user principal))
   (let ((current-tips (get amount (get-user-daily-tips user)))
-        (limit (var-get daily-tip-limit)))
+        (limit (get-effective-daily-limit user)))
     (if (>= current-tips limit)
       u0
       (- limit current-tips))))
@@ -91,6 +95,13 @@
   (default-to 
     { total: u0, last-tip-block: u0 }
     (map-get? user-total-tips user)))
+
+(define-read-only (get-effective-daily-limit (user principal))
+  (let ((override (default-to u0 (map-get? user-limit-overrides user))))
+    (if (> override u0) override (var-get daily-tip-limit))))
+
+(define-read-only (get-user-daily-limit (user principal))
+  (get-effective-daily-limit user))
 
 (define-read-only (get-daily-stats (day uint))
   (default-to 
@@ -174,7 +185,7 @@
         (user-key { user: tx-sender, day: current-day })
         (current-user-tips (get amount (get-user-daily-tips tx-sender)))
         (new-total (+ current-user-tips amount))
-        (daily-limit (var-get daily-tip-limit))
+        (daily-limit (get-effective-daily-limit tx-sender))
         (user-stats (get-user-total-tips tx-sender))
         (current-day-stats (get-daily-stats current-day)))
     
@@ -305,7 +316,7 @@
 
 (define-read-only (can-tip? (user principal) (amount uint))
   (let ((current-tips (get amount (get-user-daily-tips user)))
-        (daily-limit (var-get daily-tip-limit)))
+        (daily-limit (get-effective-daily-limit user)))
     (and 
       (var-get contract-active)
       (> amount u0)
@@ -319,7 +330,7 @@
         (multiplier (get-milestone-multiplier (get milestone-level milestone-data)))
         (boosted-amount (/ (* amount multiplier) u100))
         (new-total (+ current-user-tips boosted-amount))
-        (daily-limit (var-get daily-tip-limit))
+        (daily-limit (get-effective-daily-limit tx-sender))
         (user-stats (get-user-total-tips tx-sender))
         (current-day-stats (get-daily-stats current-day)))
     
@@ -565,3 +576,16 @@
     (ok { 
       new-rate: new-rate
     })))
+
+(define-public (set-user-daily-limit (user principal) (new-limit uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> new-limit u0) err-invalid-amount)
+    (map-set user-limit-overrides user new-limit)
+    (ok new-limit)))
+
+(define-public (clear-user-daily-limit (user principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-delete user-limit-overrides user)
+    (ok true)))
